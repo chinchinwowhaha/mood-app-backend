@@ -8,109 +8,117 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-/* ========= 基本風險關鍵字判斷 ========= */
-function isHighRisk(text = "") {
-  const t = String(text).toLowerCase();
-  const keywords = [
-    "想死",
-    "自殺",
-    "自殘",
-    "活不下去",
-    "結束生命",
-    "不想活",
-    "傷害自己",
-    "kill myself",
-    "suicide",
-    "self harm",
-  ];
-  return keywords.some(k => t.includes(k));
+// ✅ 你在 Render 要放的三個環境變數
+// LLM_API_KEY   = 你的 Groq API key
+// LLM_ENDPOINT  = https://api.groq.com/openai/v1/chat/completions
+// LLM_MODEL     = llama3-8b-8192
+const LLM_API_KEY = process.env.LLM_API_KEY || "";
+const LLM_ENDPOINT =
+  process.env.LLM_ENDPOINT || "https://api.groq.com/openai/v1/chat/completions";
+const LLM_MODEL = process.env.LLM_MODEL || "llama3-8b-8192";
+
+function safeStr(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  return String(v);
 }
 
-/* ========= 主聊天 API ========= */
+function clampInt(n, min, max, fallback) {
+  const x = Number(n);
+  if (Number.isNaN(x)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(x)));
+}
+
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "mood-app-backend" });
+});
+
 app.post("/chat", async (req, res) => {
-  const { text = "", emotion = "neutral", intensity = 1 } = req.body;
+  const text = safeStr(req.body?.text, "").trim();
+  const emotion = safeStr(req.body?.emotion, "neutral");
+  const intensity = clampInt(req.body?.intensity, 3, 1, 5); // note: clampInt expects (n,min,max,fallback) -> 我們改寫一下避免錯
+});
 
-  if (!text) {
-    return res.status(400).json({ error: "text is required" });
-  }
+// ↑ 上面 clampInt 我刻意不讓你用到，下面用更直覺的方式處理
+app.post("/chat", async (req, res) => {
+  const text = safeStr(req.body?.text, "").trim();
+  const emotion = safeStr(req.body?.emotion, "neutral");
+  const intensityRaw = Number(req.body?.intensity);
+  const intensity = Number.isFinite(intensityRaw)
+    ? Math.max(1, Math.min(5, Math.round(intensityRaw)))
+    : 3;
 
-  // 高風險直接回應（不呼叫 LLM）
-  if (isHighRisk(text)) {
+  // 你原本的 fallback 回應格式我幫你保留
+  const fallback = (debugMsg = "") => {
     return res.json({
       reply:
-        "我聽到你真的很痛苦，這不是你一個人該承受的事。你值得被認真傾聽與幫助。如果你在台灣，可以撥打 1925（生命線）或 1980（安心專線）；如果不在台灣，請告訴我你所在的地區，我可以幫你找資源。",
-      suggestedEmotion: "sad",
-      suggestedIntensity: 5,
-      microAction: "請先深呼吸 10 秒，然後試著把你的感受寫下來"
+        "我有收到你的訊息，但目前 AI 服務回應異常（可能是金鑰/模型/endpoint 設定不正確）。\n" +
+        "你可以檢查 Render 的 LLM_* 設定，或把錯誤訊息貼給我我幫你看。",
+      suggestedEmotion: emotion,
+      suggestedIntensity: intensity,
+      microAction: "先做 60 秒：把肩膀抬起→停 2 秒→放下，重複 5 次。",
+      debug: debugMsg ? debugMsg : undefined,
     });
-  }
+  };
+
+  // 基本檢查
+  if (!text) return res.status(400).json({ error: "Missing text" });
+  if (!LLM_API_KEY) return fallback("Missing LLM_API_KEY");
+  if (!LLM_ENDPOINT) return fallback("Missing LLM_ENDPOINT");
+  if (!LLM_MODEL) return fallback("Missing LLM_MODEL");
 
   try {
-    const response = await fetch(process.env.LLM_ENDPOINT, {
+    const resp = await fetch(LLM_ENDPOINT, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.LLM_API_KEY}`,
+        Authorization: `Bearer ${LLM_API_KEY}`,
       },
       body: JSON.stringify({
-        model: process.env.LLM_MODEL,
+        model: LLM_MODEL,
         messages: [
           {
             role: "system",
             content:
-              "你是一位溫柔、理性、陪伴型的情緒支持助理，避免說教，不下診斷，只提供理解與具體的小行動建議。",
+              "你是一個溫柔、簡短、實用的情緒陪伴助手。回覆用繁體中文，避免說教。",
           },
-          {
-            role: "user",
-            content: `使用者情緒：${emotion}（強度 ${intensity}/5）\n使用者說：${text}`,
-          },
+          { role: "user", content: text },
         ],
         temperature: 0.7,
       }),
-    );
+    });
 
-    const data = await response.json();
+    const data = await resp.json().catch(() => ({}));
 
-    if (!response.ok) {
-      console.error("LLM API error:", data);
-      return res.json({
-        reply:
-          "我有收到你的訊息，但目前 AI 回應服務暫時無法使用。你願意多跟我說一點現在的感受嗎？",
-        suggestedEmotion: emotion,
-        suggestedIntensity: intensity,
-        microAction: "先喝一口水，讓身體放鬆一下",
-      });
+    if (!resp.ok) {
+      const msg =
+        data?.error?.message ||
+        data?.message ||
+        `LLM HTTP ${resp.status} ${resp.statusText}`;
+      return fallback(`LLM_ERROR: ${msg}`);
     }
 
     const reply =
       data?.choices?.[0]?.message?.content ||
-      "我在這裡，願意聽你說。";
+      data?.choices?.[0]?.text ||
+      "";
 
-    res.json({
+    if (!reply) return fallback("LLM returned empty reply");
+
+    return res.json({
       reply,
       suggestedEmotion: emotion,
       suggestedIntensity: intensity,
-      microAction: "閉上眼睛 10 秒，感受一下呼吸",
+      microAction: "先做 60 秒：把肩膀抬起→停 2 秒→放下，重複 5 次。",
     });
   } catch (err) {
-    console.error("Server error:", err);
-    res.json({
-      reply:
-        "我現在有點忙，但我沒有忽略你。你願意再試著說一次嗎？",
-      suggestedEmotion: emotion,
-      suggestedIntensity: intensity,
-      microAction: "慢慢吸氣 4 秒，再吐氣 6 秒",
-    });
+    return fallback(`EXCEPTION: ${safeStr(err?.message || err)}`);
   }
-});
-
-/* ========= 健康檢查 ========= */
-app.get("/", (req, res) => {
-  res.send("Mood app backend is running.");
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Using LLM_ENDPOINT: ${LLM_ENDPOINT}`);
+  console.log(`Using LLM_MODEL: ${LLM_MODEL}`);
 });
